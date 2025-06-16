@@ -1,0 +1,15 @@
+flask
+flask-cors
+numpy
+pandas
+microsoft-aurora
+ecmwf-api-client
+gcsfs
+zarr
+cfgrib
+matplotlib
+xarray
+netcdf4
+tqdm
+huggingface_hub
+torch
