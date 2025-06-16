@@ -13,3 +13,4 @@ netcdf4
 tqdm
 huggingface_hub
 torch
+gunicorn
