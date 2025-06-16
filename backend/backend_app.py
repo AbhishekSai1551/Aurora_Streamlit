@@ -1,4 +1,3 @@
-# backend/backend_app.py
 import os
 import time
 import datetime
@@ -22,16 +21,23 @@ from huggingface_hub import hf_hub_download
 DOWNLOAD_PATH = Path("./aurora_downloads").expanduser()
 DOWNLOAD_PATH.mkdir(parents=True, exist_ok=True)
 
-# Retrieve ECMWF credentials from environment variables for production deployment
-# For local testing, you might still use ~/.ecmwfapirc, but for deployment, env vars are preferred.
+# Retrieve ECMWF credentials from environment variables for production deployment.
+# For local testing, these variables must be set in your environment
+# (e.g., export ECMWF_API_KEY="your_key" in your shell, or via a .env file and `python-dotenv`).
+# For deployment, cloud platforms provide ways to set these securely.
 ECMWF_API_KEY = os.environ.get('ECMWF_API_KEY')
 ECMWF_API_EMAIL = os.environ.get('ECMWF_API_EMAIL')
 ECMWF_API_URL = os.environ.get('ECMWF_API_URL', 'https://api.ecmwf.int/v1') # Default URL
 
 # Ensure keys are present if we intend to use them explicitly
 if not ECMWF_API_KEY or not ECMWF_API_EMAIL:
-    print("WARNING: ECMWF_API_KEY or ECMWF_API_EMAIL environment variables are not set. "
-          "ECMWF data download might fail if not configured via ~/.ecmwfapirc.")
+    # Changed to raise a RuntimeError to prevent startup if critical keys are missing
+    # for data download, making it explicit.
+    raise RuntimeError(
+        "ECMWF_API_KEY or ECMWF_API_EMAIL environment variables are not set. "
+        "These are required for downloading HRES-WAM data. "
+        "Please set them in your environment or deployment platform."
+    )
 
 ECMWF_WAVE_VARIABLES: dict[str, str] = {
     "swh": "140229",
@@ -130,8 +136,7 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
     if not wave_grib_file.exists():
         print(f"Downloading HRES-WAM data for {day}...")
         try:
-            # Pass key/email explicitly if environment variables are defined,
-            # otherwise ecmwfapi will fall back to ~/.ecmwfapirc
+            # CORRECTED: Using the variables populated from environment variables
             c = ecmwfapi.ECMWFService("mars", url=ECMWF_API_URL, key=ECMWF_API_KEY, email=ECMWF_API_EMAIL)
             c.execute(
                 f"""
