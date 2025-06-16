@@ -1,3 +1,4 @@
+# backend/backend_app.py
 import os
 import time
 import datetime
@@ -12,16 +13,25 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# Ensure these imports are correct based on your aurora installation
-# It's crucial that 'aurora' package is installed correctly and contains Aurorawave, rollout, Batch, Metadata
 from aurora import Aurorawave, rollout, Batch, Metadata
 from huggingface_hub import hf_hub_download
 
 # --- Configuration ---
 # Data will be downloaded to a local cache directory relative to the backend_app.py
 # Make sure this path is writable by the user running the Flask app
-DOWNLOAD_PATH = Path("./aurora_downloads").expanduser() # Changed to relative path
+DOWNLOAD_PATH = Path("./aurora_downloads").expanduser()
 DOWNLOAD_PATH.mkdir(parents=True, exist_ok=True)
+
+# Retrieve ECMWF credentials from environment variables for production deployment
+# For local testing, you might still use ~/.ecmwfapirc, but for deployment, env vars are preferred.
+ECMWF_API_KEY = os.environ.get('ECMWF_API_KEY')
+ECMWF_API_EMAIL = os.environ.get('ECMWF_API_EMAIL')
+ECMWF_API_URL = os.environ.get('ECMWF_API_URL', 'https://api.ecmwf.int/v1') # Default URL
+
+# Ensure keys are present if we intend to use them explicitly
+if not ECMWF_API_KEY or not ECMWF_API_EMAIL:
+    print("WARNING: ECMWF_API_KEY or ECMWF_API_EMAIL environment variables are not set. "
+          "ECMWF data download might fail if not configured via ~/.ecmwfapirc.")
 
 ECMWF_WAVE_VARIABLES: dict[str, str] = {
     "swh": "140229",
@@ -108,25 +118,21 @@ class AuroraModelManager:
 
 # --- Data Preparation Helpers ---
 def _prepare_hres(x: np.ndarray) -> torch.Tensor:
-    # This selects the first two time steps from the input array,
-    # reshapes them for batch processing (adding a batch dimension of 1),
-    # reverses along the latitude dimension (index -1), and copies to ensure contiguity.
     return torch.from_numpy(x[:2][None, -1, :].copy())
 
 def _prepare_wave(x: np.ndarray) -> torch.Tensor:
-    # This selects the first two time steps from the input array,
-    # reshapes them for batch processing (adding a batch dimension of 1).
     return torch.from_numpy(x[:2][None])
 
 def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bounds: tuple):
     day = target_date_str
-    
-    # --- 1. Download HRES-WAM data from MARS ---
+
     wave_grib_file = DOWNLOAD_PATH / f"{day}-wave.grib"
     if not wave_grib_file.exists():
         print(f"Downloading HRES-WAM data for {day}...")
         try:
-            c = ecmwfapi.ECMWFService("mars")
+            # Pass key/email explicitly if environment variables are defined,
+            # otherwise ecmwfapi will fall back to ~/.ecmwfapirc
+            c = ecmwfapi.ECMWFService("mars", url=ECMWF_API_URL, key=ECMWF_API_KEY, email=ECMWF_API_EMAIL)
             c.execute(
                 f"""
             request,
@@ -145,7 +151,9 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
             )
             print("HRES-WAM data downloaded!")
         except Exception as e:
-            raise RuntimeError(f"Failed to download HRES-WAM data from ECMWF: {e}. Ensure ~/.ecmwfapirc is configured.")
+            raise RuntimeError(f"Failed to download HRES-WAM data from ECMWF: {e}. "
+                               f"Ensure ECMWF_API_KEY and ECMWF_API_EMAIL environment variables are set correctly, "
+                               f"and you have accepted the necessary data licenses on the ECMWF website.")
     else:
         print(f"HRES-WAM data for {day} already exists.")
 
@@ -215,7 +223,10 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
     
     if surf_vars_ds_cropped.sizes['latitude'] == 0 or surf_vars_ds_cropped.sizes['longitude'] == 0:
         raise ValueError(f"No data found for the specified region Lat: {lat_bounds}, Lon: {lon_bounds}. "
-                         "Please check the coordinates. Global data is at 0.25x0.25 resolution.")
+                         f"Please check the coordinates. Global data is at 0.25x0.25 resolution. "
+                         f"Cropped latitude range: {surf_vars_ds_cropped.latitude.values.min():.2f}-{surf_vars_ds_cropped.latitude.values.max():.2f}, "
+                         f"longitude range: {surf_vars_ds_cropped.longitude.values.min():.2f}-{surf_vars_ds_cropped.longitude.values.max():.2f}")
+
 
     surf_vars_input = {
         "2t": _prepare_hres(surf_vars_ds_cropped["2m_temperature"].values),
@@ -249,9 +260,6 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
         metadata=Metadata(
             lat=torch.from_numpy(surf_vars_ds_cropped.latitude.values[::-1].copy()),
             lon=torch.from_numpy(surf_vars_ds_cropped.longitude.values),
-            # The time stamp for Aurora's input batch corresponds to the 06:00:00 time step
-            # after processing if using the PDF's example of 00:00 and 06:00 initial data
-            # The PDF extracts [1] which corresponds to the second time point (06:00).
             time=(surf_vars_ds_cropped.time.values.astype("datetime64[s]").tolist()[1],),
             atmos_levels=tuple(int(level) for level in atmos_vars_ds_cropped.level.values),
         ),
@@ -297,12 +305,9 @@ def predict():
         output_data = []
         target_variables = ["swh1", "pp1d", "wind", "mwp", "shts"] 
 
-        # The initial_unix_time is derived from the second time step of the input data (06:00 UTC)
-        # because the PDF's example prepares the batch with time index [1].
         initial_unix_time = original_cropped_ds.time.values.astype("datetime64[s]").tolist()[1].timestamp()
         
         for i, pred_batch in enumerate(preds_batches):
-            # Each step is a 6-hour forecast from the initial_unix_time
             forecast_time = initial_unix_time + ((i + 1) * 6 * 3600)
 
             lats = original_cropped_ds.latitude.values
