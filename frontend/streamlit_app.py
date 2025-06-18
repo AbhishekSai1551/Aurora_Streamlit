@@ -143,10 +143,14 @@ with col_selector:
 
     st.write(f"Region will be around Lat: ({lat_bounds[0]:.2f}, {lat_bounds[1]:.2f}), Lon: ({lon_bounds[0]:.2f}, {lon_bounds[1]:.2f})")
 
-    min_date = datetime.date(2016, 1, 1)
-    max_date = datetime.date(2022, 12, 31)
+    # --- UPDATED DATE RANGE TO 2024-2025 ---
+    # Be aware that WeatherBench2 HRES_T0 might not have data past 2022.
+    # The ECMWF Open Data GCS (wave data) should be up-to-date.
+    min_date = datetime.date(2024, 1, 1)
+    max_date = datetime.date(2025, 6, 17) # Current date
+    
     selected_date = st.date_input("Select Target Date (YYYY-MM-DD):", 
-                                  value=datetime.date(2022, 9, 16),
+                                  value=datetime.date(2024, 1, 1), # Default to a date in new range
                                   min_value=min_date, max_value=max_date,
                                   key="date_selector")
 
