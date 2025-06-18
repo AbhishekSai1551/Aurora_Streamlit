@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import xarray as xr
 import fsspec
+# Removed google.cloud.bigquery and pandas as they are no longer needed for wave data from GCS
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -14,17 +15,20 @@ from flask_cors import CORS
 from aurora import Aurorawave, rollout, Batch, Metadata
 from huggingface_hub import hf_hub_download
 
-# --- New Google Cloud Imports ---
-from google.cloud import bigquery
-import pandas as pd # For processing BigQuery results
-
 # --- Configuration ---
 DOWNLOAD_PATH = Path("./aurora_downloads").expanduser()
 DOWNLOAD_PATH.mkdir(parents=True, exist_ok=True)
 
-# ECMWF_WAVE_VARIABLES will be used for mapping/querying.
-# Note: For BigQuery, you'll need to map these to actual column names
-# or parameter IDs in the BQ tables. The 6-digit number is the ECMWF parameter ID.
+# ECMWF API keys are NOT needed for public gs://ecmwf-open-data/ bucket
+# The check below is now removed as we don't use ecmwfapi directly
+# if not ECMWF_API_KEY or not ECMWF_API_EMAIL:
+#     raise RuntimeError(
+#         "ECMWF_API_KEY or ECMWF_API_EMAIL environment variables are not set. "
+#         "These were previously required for downloading HRES-WAM data via ECMWF API. "
+#         "Now using Google Cloud Storage public data."
+#     )
+
+# ECMWF_WAVE_VARIABLES are still used for parameter IDs and checking their presence
 ECMWF_WAVE_VARIABLES: dict[str, str] = {
     "swh": "140229", # Significant height of total swell and wind waves
     "pp1d": "140231", # Primary wave mean period
@@ -46,6 +50,19 @@ ECMWF_WAVE_VARIABLES: dict[str, str] = {
     "wind": "140245", # Wind speed at 10m (might also be available in WeatherBench2 as 10m_u/v_component_of_wind)
 }
 
+# The specific parameter IDs for ECMWF_OPEN_DATA_WAVE_PARAMETERS are numerical, e.g., '140229'
+# We will use these directly in the GRIB request.
+ECMWF_OPEN_DATA_WAVE_PARAMETERS = [
+    "140229", # swh
+    "140231", # pp1d
+    "140232", # mwp
+    "140230", # mwd
+    "140245", # wind (10m_wind speed/gust) - check if this is the correct param for 'wind'
+              # Note: 'wind' might be derived from '10u' and '10v' in some models.
+              # If your Aurora model expects a specific 'wind' variable, ensure this ID is correct.
+              # The PDF example shows 'wind' being mapped to '140245'.
+]
+
 WEATHERBENCH2_SURFACE_VARS = [
     "10m_u_component_of_wind",
     "10m_v_component_of_wind",
@@ -61,206 +78,156 @@ WEATHERBENCH2_ATMOS_VARS = [
 ]
 WEATHERBENCH2_URL = "gs://weatherbench2/datasets/hres_t0/2016-2022-6h-1440x721.zarr"
 
+# For ECMWF Open Data in GCS, you can find the actual stream/type for wave data.
+# Based on the naming convention, 'wave' stream and 'fc' (forecast) type for 0-step analysis data.
+ECMWF_OPEN_DATA_GCS_BASE = "gs://ecmwf-open-data"
+ECMWF_OPEN_DATA_WAVE_STREAM = "wave" # Use 'wave' for ocean wave fields
+ECMWF_OPEN_DATA_WAVE_TYPE = "fc"     # Use 'fc' for forecast, even for analysis (step=0)
+ECMWF_OPEN_DATA_RESOLUTION = "0p25" # Assuming 0.25 degree resolution for wave data
+
 STATIC_REPO_ID = "microsoft/aurora"
 STATIC_FILENAME = "aurora-0.25-wave-static.pickle"
 
 app = Flask(__name__)
-CORS(app)
+# For local testing, CORS(app) is fine. For deployment, restrict to your frontend URL.
+CORS(app) 
 
-# --- AuroraModelManager class remains the same ---
+# --- AuroraWave Model Loader (Singleton pattern) ---
 class AuroraModelManager:
     _instance = None
     _model = None
+    _device = "cpu"
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(AuroraModelManager, cls).__new__(cls)
-            print("Loading AuroraWave model...")
-            cls._model = Aurorawave()
-            cls._model.load_checkpoint()
-            cls._model.eval()
-            # Try to move to GPU if available
-            if torch.cuda.is_available():
-                cls._model.to("cuda")
-                print("Model loaded to GPU.")
-            else:
-                cls._model.to("cpu")
-                print("Model loaded to CPU.")
+            try:
+                print("Initializing AuroraWave model...")
+                cls._instance._model = Aurorawave()
+                cls._instance._model.load_checkpoint()
+                cls._instance._model.eval()
+
+                if torch.cuda.is_available():
+                    cls._instance._device = "cuda"
+                    cls._instance._model = cls._instance._model.to(cls._instance._device)
+                    print(f"AuroraWave model loaded successfully and moved to {cls._instance._device}.")
+                else:
+                    cls._instance._device = "cpu"
+                    cls._instance._model = cls._instance._model.to(cls._instance._device)
+                    print(f"AuroraWave model loaded successfully on CPU (CUDA not available).")
+            except Exception as e:
+                print(f"ERROR: Failed to load AuroraWave model: {e}")
+                cls._instance._model = None
+                raise RuntimeError(f"Failed to load AuroraWave model: {e}") # Raise to stop app if model fails
         return cls._instance
 
     def get_model(self):
-        return self._model
+        if self._model is None:
+            raise RuntimeError("AuroraWave model failed to load. Check previous logs.")
+        return self._model, self._device
 
 # --- Data Preparation Helpers ---
 def _prepare_hres(x: np.ndarray) -> torch.Tensor:
-    # Ensure input is (time, lat, lon) or (time, level, lat, lon)
+    """Prepares HRES data (2m_temperature, 10m_wind, msl) for Aurora input."""
     # This prepares it for Aurora, typically taking the initial state.
-    # The [None, -1, :] from original implies taking last time step for 2D.
-    # Let's adjust to ensure it takes the first (initial) time step for the 2D surface variables.
+    # The [None] adds a batch dimension. x[0] takes the first time step.
     if x.ndim == 3: # (time, lat, lon)
         return torch.from_numpy(x[0:1].copy()) # Take first time step, keep time dim (1, lat, lon)
     elif x.ndim == 4: # (time, level, lat, lon)
         return torch.from_numpy(x[0:1].copy()) # Take first time step, keep time dim (1, level, lat, lon)
     else:
-        raise ValueError(f"Unexpected array dimensions: {x.ndim}")
+        raise ValueError(f"Unexpected HRES array dimensions: {x.ndim}")
 
 def _prepare_wave(x: np.ndarray) -> torch.Tensor:
-    # Wave data are usually 2D (time, lat, lon)
-    # Prepare for Aurora which might expect (1, lat, lon)
-    return torch.from_numpy(x[0:1].copy())
+    """Prepares wave data for Aurora input."""
+    # Wave data are usually (time, lat, lon). Take first time step.
+    if x.ndim == 3: # (time, lat, lon)
+        return torch.from_numpy(x[0:1].copy())
+    else:
+        raise ValueError(f"Unexpected wave array dimensions: {x.ndim}")
 
 
 def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bounds: tuple):
-    day = target_date_str # e.g., "20220916"
-    target_date_dt = datetime.datetime.strptime(day, "%Y%m%d").date() # For BigQuery date filtering
+    day = target_date_str # e.g., "20240101"
+    
+    # --- 1. Download HRES-WAM data (Wave variables) from ECMWF Open Data GCS ---
+    # Need to download for each of the 4 analysis times (00Z, 06Z, 12Z, 18Z)
+    analysis_times = ["00", "06", "12", "18"]
+    all_wave_grib_files = [] # To store paths of downloaded GRIB files
+    
+    for hh in analysis_times:
+        # Construct the GCS path based on the naming convention
+        # gs://ecmwf-open-data/[yyyymmdd]/[HH]z/[resol]/[stream]/[yyyymmdd][HH]0000-[step][U]-[stream]-[type].[format]
+        gcs_wave_path = (
+            f"{ECMWF_OPEN_DATA_GCS_BASE}/{day}/{hh}z/{ECMWF_OPEN_DATA_RESOLUTION}/"
+            f"{ECMWF_OPEN_DATA_WAVE_STREAM}/{day}{hh}0000-0h-{ECMWF_OPEN_DATA_WAVE_STREAM}-{ECMWF_OPEN_DATA_WAVE_TYPE}.grib2"
+        )
+        local_wave_grib_file = DOWNLOAD_PATH / f"{day}-wave-{hh}.grib2"
+        all_wave_grib_files.append(local_wave_grib_file)
 
-    # --- 1. Download HRES-WAM data (Wave variables) from BigQuery ---
-    wave_nc_file = DOWNLOAD_PATH / f"{day}-wave-gcp.nc" # Save as NetCDF from BigQuery
+        if not local_wave_grib_file.exists():
+            print(f"Downloading HRES-WAM data for {day} {hh}Z from GCS: {gcs_wave_path}...")
+            try:
+                with fsspec.open(gcs_wave_path, "rb") as f_remote:
+                    with open(local_wave_grib_file, "wb") as f_local:
+                        f_local.write(f_remote.read())
+                print(f"HRES-WAM data for {day} {hh}Z downloaded!")
+            except FileNotFoundError:
+                raise RuntimeError(f"HRES-WAM GRIB file not found on GCS: {gcs_wave_path}. "
+                                   f"Data might not be available for this date/time or path is incorrect.")
+            except Exception as e:
+                raise RuntimeError(f"Failed to download HRES-WAM data from GCS for {day} {hh}Z: {e}. "
+                                   f"Check your internet connection or GCP authentication.")
+        else:
+            print(f"HRES-WAM data for {day} {hh}Z already exists locally.")
 
-    if not wave_nc_file.exists():
-        print(f"Querying BigQuery for HRES-WAM data for {day}...")
-        try:
-            client = bigquery.Client()
-            
-            # --- IMPORTANT: BigQuery Query and Data Reshaping ---
-            # You MUST adjust this query based on the exact schema of the ECMWF tables
-            # in bigquery-public-data.open_data_ecmwf.
-            #
-            # The 'grib' table stores raw GRIB messages as bytes, which is complex to use directly.
-            # The 'forecast' or 'reanalysis' tables typically have parsed data.
-            #
-            # This is a *placeholder query*. You need to inspect the schema of
-            # `bigquery-public-data.open_data_ecmwf.forecast` or `reanalysis` to get
-            # the exact column names for variables like SWH, MWP, MWD, etc.
-            # Also confirm the time field name (e.g., 'time', 'valid_time', 'forecast_time').
-            #
-            # Assuming 'forecast' table for simplicity, but 'reanalysis' might be better for 'an' type.
-            # You might need to query for `paramId` and then pivot.
-            
-            # Example query for common parameters - YOU WILL LIKELY NEED TO ADJUST THIS
-            # ECMWF_WAVE_VARIABLES_BQ_MAP will map your desired variable names
-            # to their actual column names in BigQuery.
-            # You'd typically find these as `paramid_140229`, or `swh`, `mean_wave_period` etc.
-            
-            # This is a generic way if parameters are in a 'parameterId' column
-            # and values in a 'value' column. This might not be exact for ECMWF public data.
-            # A more common structure for BigQuery public weather data might be columns like:
-            #   (valid_time, latitude, longitude, swh, mwd, pp1d, ...)
-            
-            # For demonstration, let's assume a structure like:
-            # valid_time, latitude, longitude, parameter_id, value
-            # and we need to pivot it.
-            
-            # Recommended approach: find a table in bigquery-public-data.open_data_ecmwf
-            # that directly has swh, mwd etc. as columns, or a parsed table.
-            
-            # For now, let's make a generic query and emphasize user's adjustment.
-            # We are trying to get the ANALYSIS ('an') data at 00, 06, 12, 18 UTC for the day.
-            
-            # Example: Using the `forecast` table, which might include `type='an'`
-            # and `step=0` for analysis.
-            # YOU MUST CHECK THE ACTUAL COLUMN NAMES AND DATA AVAILABILITY IN BQ.
-            
-            target_dates_str = [
-                f"'{target_date_dt.isoformat()}T00:00:00Z'",
-                f"'{target_date_dt.isoformat()}T06:00:00Z'",
-                f"'{target_date_dt.isoformat()}T12:00:00Z'",
-                f"'{target_date_dt.isoformat()}T18:00:00Z'"
-            ]
-            
-            # Convert ECMWF_WAVE_VARIABLES to parameter IDs for BQ query
-            param_ids_to_fetch = list(ECMWF_WAVE_VARIABLES.values())
-            param_ids_str = ', '.join([f"'{pid}'" for pid in param_ids_to_fetch])
+    # Open all downloaded GRIB files into a single xarray Dataset
+    # cfgrib can open multiple GRIB files at once if they have compatible dimensions
+    try:
+        wave_vars_ds = xr.open_mfdataset(
+            [str(f) for f in all_wave_grib_files],
+            engine="cfgrib",
+            concat_dim="time", # Assuming 'time' is the dimension to concatenate along
+            combine='nested',
+            coords="minimal",
+            data_vars="minimal",
+            compat="override",
+            # This is important for ensuring cfgrib works with multiple files
+            # For each file opened separately, `backend_kwargs={"indexpath": ""}` might be needed
+            # but for open_mfdataset, it might handle indices across files.
+            # If errors occur, try opening individual files and then merging.
+        )
+        # Ensure time dimension is sorted ascending if needed
+        wave_vars_ds = wave_vars_ds.sortby('time')
+        print("Combined HRES-WAM data loaded into xarray dataset.")
 
-            # This query attempts to fetch data for specific parameter IDs
-            # You MUST verify if 'parameter_id' and 'value' columns exist and if this
-            # is how HRES-WAM is stored for analysis (`type='an'`, `step=0`).
-            query = f"""
-                SELECT
-                    valid_time,
-                    latitude,
-                    longitude,
-                    parameter_id,
-                    value
-                FROM
-                    `bigquery-public-data.open_data_ecmwf.forecast` -- or `reanalysis`, or a more specific table
-                WHERE
-                    valid_time IN ({','.join(target_dates_str)})
-                    AND parameter_id IN ({param_ids_str})
-                    AND type = 'an' -- 'an' for analysis data
-                    AND step = 0    -- 0-hour forecast means it's an analysis
-                ORDER BY
-                    valid_time, latitude DESC, longitude ASC
-            """
-            
-            job = client.query(query)
-            df = job.to_dataframe()
-
-            if df.empty:
-                raise ValueError(f"No wave data found in BigQuery for date {day} with specified parameters and analysis type. "
-                                 f"Please check the query, table name, parameter IDs, and 'type'/'step' filters.")
-
-            # --- Reshape DataFrame to xarray.Dataset ---
-            # Pivot the DataFrame from long format (parameter_id, value) to wide format (columns for each param_id)
-            # Then convert to xarray.Dataset
-            
-            # Map parameter IDs back to common names for xarray
-            param_id_to_name = {v: k for k, v in ECMWF_WAVE_VARIABLES.items()}
-            df['parameter_name'] = df['parameter_id'].astype(str).map(param_id_to_name)
-            
-            if df['parameter_name'].isnull().any():
-                # This means some parameter_ids from BQ were not in our ECMWF_WAVE_VARIABLES map
-                # You might need to adjust ECMWF_WAVE_VARIABLES or the BQ query.
-                print("Warning: Some parameter_ids from BigQuery were not mapped to Aurora variable names.")
-            
-            # Pivot to create columns for each variable
-            df_pivot = df.pivot_table(
-                index=['valid_time', 'latitude', 'longitude'],
-                columns='parameter_name',
-                values='value'
-            ).reset_index()
-
-            # Ensure 'valid_time' is datetime type
-            df_pivot['valid_time'] = pd.to_datetime(df_pivot['valid_time'])
-
-            # Convert to xarray Dataset. Ensure correct dimensions and coordinate order.
-            # xarray typically expects lat to be descending (N to S) for slice(max, min)
-            # and lon ascending (W to E).
-            wave_vars_ds = df_pivot.set_index(['valid_time', 'latitude', 'longitude']).to_xarray()
-            
-            # Ensure latitudes are sorted correctly (N to S for `sel` later)
-            if wave_vars_ds.latitude.values[0] < wave_vars_ds.latitude.values[-1]:
-                wave_vars_ds = wave_vars_ds.sel(latitude=slice(None, None, -1))
-
-            # Save the dataset to a local NetCDF file for caching
-            wave_vars_ds.to_netcdf(str(wave_nc_file))
-            print("HRES-WAM data downloaded from BigQuery and saved locally!")
-
-        except Exception as e:
-            # Catch a broader exception if BigQuery setup or query is complex
-            raise RuntimeError(f"Failed to query and process HRES-WAM data from BigQuery: {e}. "
-                               f"Please ensure you have GCP authentication, correct BigQuery project, "
-                               f"and the SQL query matches the dataset schema for wave parameters.")
-    else:
-        print(f"HRES-WAM data for {day} already exists locally from GCP.")
-        wave_vars_ds = xr.open_dataset(str(wave_nc_file), engine="netcdf4")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load HRES-WAM GRIB files into xarray: {e}. "
+                           f"Ensure cfgrib is installed and files are valid GRIB2.")
 
 
     # --- 2. Download Meteorological variables from WeatherBench2 (Already on GCP) ---
     surface_nc_file = DOWNLOAD_PATH / f"{day}-surface-level.nc"
     atmos_nc_file = DOWNLOAD_PATH / f"{day}-atmospheric.nc"
     
+    # Load global Zarr store once and keep it in memory for efficiency
     if not hasattr(download_and_prepare_data, '_ds_global'):
         print("Opening WeatherBench2 Zarr store on GCS...")
+        # Note: WeatherBench2 data range is typically 2016-2022.
+        # If you need 2024-2025 data, you'll need a different source for HRES-T0.
+        # For this refactor, we assume WeatherBench2 is still acceptable for atmos/surface.
         download_and_prepare_data._ds_global = xr.open_zarr(fsspec.get_mapper(WEATHERBENCH2_URL), chunks=None)
         print("WeatherBench2 Zarr store opened.")
     ds_global = download_and_prepare_data._ds_global
 
+    # The target_date_dt from frontend will be a date object
+    target_date_dt_obj = datetime.datetime.strptime(day, "%Y%m%d").date()
+
     if not surface_nc_file.exists():
         print(f"Downloading surface-level variables for {day} from WeatherBench2 (GCS)...")
         # Ensure 'time' dimension selection matches 'day' for WeatherBench2 data
-        # WeatherBench2's time dimension might be `datetime64[ns]`. Convert target_date_dt.
-        ds_surf = ds_global[WEATHERBENCH2_SURFACE_VARS].sel(time=pd.to_datetime(target_date_dt)).compute()
+        # WeatherBench2 has hourly data, select by date
+        ds_surf = ds_global[WEATHERBENCH2_SURFACE_VARS].sel(time=str(target_date_dt_obj)).compute()
         ds_surf.to_netcdf(str(surface_nc_file))
         print("Surface-level variables downloaded from WeatherBench2!")
     else:
@@ -268,7 +235,7 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
 
     if not atmos_nc_file.exists():
         print(f"Downloading atmospheric variables for {day} from WeatherBench2 (GCS)...")
-        ds_atmos = ds_global[WEATHERBENCH2_ATMOS_VARS].sel(time=pd.to_datetime(target_date_dt)).compute()
+        ds_atmos = ds_global[WEATHERBENCH2_ATMOS_VARS].sel(time=str(target_date_dt_obj)).compute()
         ds_atmos.to_netcdf(str(atmos_nc_file))
         print("Atmospheric variables downloaded from WeatherBench2!")
     else:
@@ -291,12 +258,6 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
         decode_timedelta=True,
     )
 
-    wave_vars_ds = xr.open_dataset(
-        str(wave_nc_file), # Use the path to the NetCDF generated from BigQuery
-        engine="netcdf4",
-        decode_timedelta=True
-    )
-
     atmos_vars_ds = xr.open_dataset(
         DOWNLOAD_PATH / f"{day}-atmospheric.nc",
         engine="netcdf4",
@@ -309,39 +270,41 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
     # Ensure coordinates are float for slicing
     lat_min, lat_max, lon_min, lon_max = float(lat_min), float(lat_max), float(lon_min), float(lon_max)
 
-    # sel(latitude=slice(max, min)) is typical for xarray when lat coordinates run from N to S
-    # Ensure your BigQuery data output and xarray reshaping results in latitude in this order.
-    # Also adjust longitude to handle 0-360 vs -180-180 if necessary, Aurora expects 0-360.
-    
-    # WeatherBench2 has longitudes from 0 to 359.75. Your input might be -180 to 180.
-    # Convert input longitudes to 0-360 range if they are negative.
-    if lon_min < 0:
-        lon_min += 360
-    if lon_max < 0:
-        lon_max += 360
+    # WeatherBench2 and ECMWF Open Data longitudes are typically 0 to 359.75.
+    # If frontend sends -180 to 180, convert to 0-360 range for slicing.
+    # Aurora itself expects 0-360 for lon.
+    lon_min_360 = lon_min % 360
+    lon_max_360 = lon_max % 360
 
-    # Ensure lon_min is less than lon_max for slicing across the 0/360 meridian if needed
-    if lon_min > lon_max: # Example: from 350 to 10 (crosses 0/360)
-        ds_part1 = ds_global.sel(longitude=slice(lon_min, 360))
-        ds_part2 = ds_global.sel(longitude=slice(0, lon_max))
-        # This merging is complex and might not work directly, simpler to get broader and crop
-        # For initial setup, assume non-meridian crossing bounds or let xarray handle it.
-        # For now, let's keep slicing simple and assume the bounds don't cross the meridian.
-        # If they do, the user will need to implement more complex slicing/merging.
-        # Aurora expects 0-360 longitudes so direct slicing might be tricky if input is -180 to 180.
-        pass # Handle this edge case later if it occurs
+    # Handle wrapping around the 0/360 meridian if min > max after conversion
+    if lon_min_360 > lon_max_360:
+        # Slice in two parts and concatenate
+        surf_vars_ds_part1 = surf_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min_360, 360))
+        surf_vars_ds_part2 = surf_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(0, lon_max_360))
+        surf_vars_ds_cropped = xr.concat([surf_vars_ds_part1, surf_vars_ds_part2], dim='longitude').sortby('longitude')
 
-    surf_vars_ds_cropped = surf_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
-    wave_vars_ds_cropped = wave_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
-    atmos_vars_ds_cropped = atmos_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min, lon_max))
+        wave_vars_ds_part1 = wave_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min_360, 360))
+        wave_vars_ds_part2 = wave_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(0, lon_max_360))
+        wave_vars_ds_cropped = xr.concat([wave_vars_ds_part1, wave_vars_ds_part2], dim='longitude').sortby('longitude')
+        
+        atmos_vars_ds_part1 = atmos_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min_360, 360))
+        atmos_vars_ds_part2 = atmos_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(0, lon_max_360))
+        atmos_vars_ds_cropped = xr.concat([atmos_vars_ds_part1, atmos_vars_ds_part2], dim='longitude').sortby('longitude')
+
+    else:
+        surf_vars_ds_cropped = surf_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min_360, lon_max_360))
+        wave_vars_ds_cropped = wave_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min_360, lon_max_360))
+        atmos_vars_ds_cropped = atmos_vars_ds.sel(latitude=slice(lat_max, lat_min), longitude=slice(lon_min_360, lon_max_360))
     
     if surf_vars_ds_cropped.sizes['latitude'] == 0 or surf_vars_ds_cropped.sizes['longitude'] == 0:
         raise ValueError(f"No data found for the specified region Lat: {lat_bounds}, Lon: {lon_bounds}. "
-                         f"Please check the coordinates. Global data is at 0.25x0.25 resolution. "
+                         f"Please check the coordinates. Global data is at {ECMWF_OPEN_DATA_RESOLUTION} resolution. "
                          f"Cropped latitude range: {surf_vars_ds_cropped.latitude.values.min():.2f}-{surf_vars_ds_cropped.latitude.values.max():.2f}, "
                          f"longitude range: {surf_vars_ds_cropped.longitude.values.min():.2f}-{surf_vars_ds_cropped.longitude.values.max():.2f}")
 
     # Prepare surf_vars_input with both meteorological and wave variables
+    # The _prepare_hres and _prepare_wave functions take `(time, [level], lat, lon)` numpy arrays
+    # and return `(1, [level], lat, lon)` torch tensors (taking first time step).
     surf_vars_input = {
         "2t": _prepare_hres(surf_vars_ds_cropped["2m_temperature"].values),
         "10u": _prepare_hres(surf_vars_ds_cropped["10m_u_component_of_wind"].values),
@@ -350,16 +313,17 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
     }
     
     # Map from the xarray dataset (wave_vars_ds_cropped) to Aurora's expected keys
-    for aurora_var_name, ecmwf_param_id in ECMWF_WAVE_VARIABLES.items():
-        # Check if the variable exists in the reshaped dataset from BigQuery
-        # BigQuery column names might be the `aurora_var_name` (e.g. 'swh')
-        # or the `ecmwf_param_id` (e.g. '140229') or something else.
-        # Adjust this check based on how your BQ data is structured.
+    # Use the keys from ECMWF_WAVE_VARIABLES and check if they exist in wave_vars_ds_cropped
+    # The 'param' from cfgrib will often be the numeric ID (e.g., '140229') or a short name ('swh')
+    # You might need to check both if cfgrib uses short names or numeric.
+    for aurora_var_name in ["swh", "pp1d", "mwd", "mwp", "shww", "mdww", "mpww", "shts", "mdts", "mpts",
+                            "swh1", "mwd1", "mwp1", "swh2", "mwd2", "mwp2", "dwi", "wind"]:
         if aurora_var_name in wave_vars_ds_cropped:
             surf_vars_input[aurora_var_name] = _prepare_wave(wave_vars_ds_cropped[aurora_var_name].values)
+        elif str(ECMWF_WAVE_VARIABLES.get(aurora_var_name)) in wave_vars_ds_cropped: # Check by param ID if named as such
+             surf_vars_input[aurora_var_name] = _prepare_wave(wave_vars_ds_cropped[str(ECMWF_WAVE_VARIABLES.get(aurora_var_name))].values)
         else:
-            # Fallback if variable is missing, but crucial to get this right from BQ.
-            print(f"Warning: Wave variable '{aurora_var_name}' (ECMWF ID: {ecmwf_param_id}) not found in BigQuery derived data for {day}. Skipping.")
+            print(f"Warning: Wave variable '{aurora_var_name}' (or its ID) not found in downloaded wave data. Skipping.")
 
     # Batch creation remains the same
     batch = Batch(
@@ -373,98 +337,128 @@ def download_and_prepare_data(target_date_str: str, lat_bounds: tuple, lon_bound
             "z": _prepare_hres(atmos_vars_ds_cropped["geopotential"].values),
         },
         metadata=Metadata(
-            lat=torch.from_numpy(surf_vars_ds_cropped.latitude.values[::-1].copy()), # Ensure N-S order for Aurora
+            # Latitude needs to be N-S for Aurora
+            lat=torch.from_numpy(surf_vars_ds_cropped.latitude.values[::-1].copy()),
             lon=torch.from_numpy(surf_vars_ds_cropped.longitude.values),
-            time=(surf_vars_ds_cropped.time.values.astype("datetime64[s]").tolist()[0],), # Initial time of the prediction
+            # The time stamp for Aurora's input batch corresponds to one of the initial analysis times.
+            # Use the first time point (00Z) from the combined wave data for initial_ds_cropped for consistency
+            time=(wave_vars_ds_cropped.time.values.astype("datetime64[s]").tolist()[0],),
             atmos_levels=tuple(int(level) for level in atmos_vars_ds_cropped.level.values),
         ),
     )
-    return batch, surf_vars_ds_cropped # Also return original cropped data for ref
+    return batch, wave_vars_ds_cropped # Return wave_vars_ds_cropped for its time dimension (all 4 steps)
 
-# --- Flask API Endpoint ---
-@app.route("/api/predict", methods=["POST"])
+
+# --- Flask App Endpoints ---
+# Initialize AuroraModelManager once at app startup
+try:
+    aurora_model_manager = AuroraModelManager()
+except RuntimeError as e:
+    print(f"FATAL: {e}. Exiting Flask app setup.")
+    exit(1)
+
+@app.route('/api/predict', methods=['POST'])
 def predict():
     data = request.get_json()
-    target_date_str = data.get("target_date")
-    lat_bounds = tuple(data.get("lat_bounds"))
-    lon_bounds = tuple(data.get("lon_bounds"))
+    n_lat = float(data.get('lat_bounds')[1]) # North Lat (max)
+    s_lat = float(data.get('lat_bounds')[0]) # South Lat (min)
+    w_lon = float(data.get('lon_bounds')[0]) # West Lon (min)
+    e_lon = float(data.get('lon_bounds')[1]) # East Lon (max)
+    prediction_date_str = data.get('target_date')
+
+    # Steps parameter is no longer explicitly sent by frontend but can be defaulted
+    steps = request.args.get('steps', type=int, default=4) # Default to 4 for 00, 06, 12, 18Z + 4 forecast steps
+
+    if not all([prediction_date_str is not None, n_lat is not None, w_lon is not None, s_lat is not None, e_lon is not None]):
+        return jsonify({"error": "Missing one or more required parameters (target_date, lat_bounds, lon_bounds)."}), 400
     
-    if not all([target_date_str, lat_bounds, lon_bounds]):
-        return jsonify({"error": "Missing parameters (target_date, lat_bounds, lon_bounds)"}), 400
+    # Note: Aurora rollout steps typically mean number of 6-hour forecast steps.
+    # The default 4 in frontend will produce initial + 4 steps (0, 6, 12, 18, 24h).
+    # You might want to adjust `steps` parameter based on desired forecast horizon.
+    # For now, keeping it flexible.
 
     try:
-        model_manager = AuroraModelManager()
-        model = model_manager.get_model()
+        model, device = aurora_model_manager.get_model()
 
-        start_time = time.time()
-        print(f"Downloading and preparing data for {target_date_str}...")
-        batch, initial_ds_cropped = download_and_prepare_data(target_date_str, lat_bounds, lon_bounds)
-        data_prep_time = time.time() - start_time
+        start_data_prep = time.time()
+        batch, initial_wave_ds_cropped = download_and_prepare_data(
+            prediction_date_str,
+            (s_lat, n_lat), # download_and_prepare_data expects (min_lat, max_lat)
+            (w_lon, e_lon)
+        )
+        data_prep_time = time.time() - start_data_prep
         print(f"Data preparation completed in {data_prep_time:.2f} seconds.")
+        
+        batch = batch.to(device)
 
-        start_time = time.time()
-        print("Running Aurora model rollout...")
+        start_rollout = time.time()
+        print(f"Running rollout for {steps} steps for region: N:{n_lat}, W:{w_lon}, S:{s_lat}, E:{e_lon} on date {prediction_date_str}")
         with torch.inference_mode():
-            # The steps parameter determines how many forecast steps (e.g., 6-hour intervals)
-            # Aurora makes. Adjust as needed. Default for wave model is often 2 (for 12 and 18hr).
-            preds = [pred.to("cpu") for pred in rollout(model, batch, steps=2)]
-        model_rollout_time = time.time() - start_time
+            # Rollout produces `steps` number of forecast outputs (0-indexed).
+            # If `steps=2`, it gives `preds[0]` (initial state) and `preds[1]` (6hr forecast).
+            preds_batches = [pred.to("cpu") for pred in rollout(model, batch, steps=steps)]
+        model_rollout_time = time.time() - start_rollout
         print(f"Model rollout completed in {model_rollout_time:.2f} seconds.")
 
-        # Prepare data for JSON response
-        predictions_data = {}
+        output_data = {}
         forecast_times = []
 
-        # Iterate through each forecast step (preds[0] is initial, preds[1] is 6h, preds[2] is 12h, etc.)
-        # Aurora returns initial state as preds[0], then preds[1], preds[2] etc. are forecasts.
-        # We need to send the forecast steps, typically starting from preds[1].
+        # Extract latitude and longitude from the initial cropped dataset
+        lats_output = initial_wave_ds_cropped.latitude.values.tolist()
+        lons_output = initial_wave_ds_cropped.longitude.values.tolist()
+
+        # The initial_wave_ds_cropped contains the 00, 06, 12, 18Z analysis data.
+        # Aurora model's `rollout` starts from the input batch's time (e.g., 00Z or 06Z depending on your Batch Metadata time selection).
+        # Its outputs `preds_batches[i]` will correspond to subsequent 6-hour steps.
+        # The first element `preds_batches[0]` is often the initial state from the input batch.
         
-        # Decide which forecast steps to return. Let's return all.
-        for i, pred_batch in enumerate(preds):
-            current_time = pred_batch.metadata.time[0] # Get timestamp for this step
-            forecast_times.append(current_time)
+        # Determine actual forecast times based on the initial input time and rollout steps
+        initial_input_time_dt64 = batch.metadata.time[0] # Get initial input time (datetime64)
+        initial_input_timestamp = pd.to_datetime(initial_input_time_dt64).timestamp() # Convert to UNIX timestamp
 
-            # Store surface variables
-            for var_name, tensor in pred_batch.surf_vars.items():
-                if var_name not in predictions_data:
-                    predictions_data[var_name] = []
-                # Remove batch and time dimensions (if only one initial time was fed in)
-                # and convert to numpy array for JSON serialization
-                predictions_data[var_name].append(tensor.squeeze().cpu().numpy().tolist())
+        for i, pred_batch in enumerate(preds_batches):
+            # Calculate forecast time for each step. Aurora steps are usually 6-hourly.
+            # If i=0, it's initial state. If i=1, it's initial + 6h.
+            current_forecast_time_unix = initial_input_timestamp + (i * 6 * 3600)
+            forecast_times.append(datetime.datetime.fromtimestamp(current_forecast_time_unix).isoformat())
+
+            # Populate predictions_data for frontend
+            for var_name, tensor_data in pred_batch.surf_vars.items():
+                if var_name not in output_data:
+                    output_data[var_name] = []
+                # Squeeze to remove batch dimension, then convert to list
+                output_data[var_name].append(tensor_data.squeeze().cpu().numpy().tolist())
             
-            # Store atmospheric variables (example for first level for simplicity, can expand)
-            # Note: Atmospheric vars have a 'level' dimension. You might want to select a specific level.
-            # For now, we'll just expose a few top-level atmospheric variables at the first available level.
-            for var_name, tensor in pred_batch.atmos_vars.items():
-                if var_name not in predictions_data:
-                    predictions_data[var_name] = []
-                # Squeeze to remove batch and time dims, then select first level (index 0)
-                # Ensure it's 2D (lat, lon) for map plotting
-                predictions_data[var_name].append(tensor.squeeze()[0].cpu().numpy().tolist()) # Taking first level
+            # Atmospheric variables (if you want to expose them, otherwise remove)
+            for var_name, tensor_data in pred_batch.atmos_vars.items():
+                # Ensure we handle levels if needed for display
+                if var_name not in output_data:
+                    output_data[var_name] = []
+                # Example: taking the first level (index 0) if it's a 4D tensor (time, level, lat, lon)
+                output_data[var_name].append(tensor_data.squeeze()[0].cpu().numpy().tolist())
 
-        # Include metadata for plotting on frontend
-        lats = initial_ds_cropped.latitude.values.tolist()
-        lons = initial_ds_cropped.longitude.values.tolist()
 
         return jsonify({
             "status": "success",
             "message": "Prediction generated successfully.",
-            "lats": lats,
-            "lons": lons,
-            "forecast_times": [t.isoformat() for t in forecast_times], # Convert datetime to ISO string
-            "predictions": predictions_data, # Dictionary of variable_name: [list of numpy arrays per step]
+            "lats": lats_output,
+            "lons": lons_output,
+            "forecast_times": forecast_times, # ISO formatted strings
+            "predictions": output_data, # Dictionary of variable_name: [list of 2D numpy arrays (converted to list) per step]
             "data_prep_time": f"{data_prep_time:.2f}s",
             "model_rollout_time": f"{model_rollout_time:.2f}s"
         }), 200
 
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 500
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except RuntimeError as re:
+        # Catch specific RuntimeErrors from download_and_prepare_data or model loading
+        return jsonify({"error": f"Backend processing error: {re}"}), 500
     except Exception as e:
+        # Catch any other unexpected errors
         app.logger.error(f"An unexpected error occurred: {e}", exc_info=True)
-        return jsonify({"error": f"An unexpected server error occurred: {e}"}), 500
+        return jsonify({"error": f"An unexpected server error occurred: {e}. Please check backend logs."}), 500
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     print("Starting Flask AuroraWave Backend...")
     app.run(debug=True, host="0.0.0.0", port=5000)
