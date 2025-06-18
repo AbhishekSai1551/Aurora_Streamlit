@@ -1,16 +1,12 @@
-flask
+Flask
 flask-cors
-numpy
-pandas
-microsoft-aurora
-ecmwf-api-client
-gcsfs
-zarr
-cfgrib
-matplotlib
-xarray
-netcdf4
-tqdm
+aurora-model # If you installed aurora via pip, it might be named differently
 huggingface_hub
-torch
+xarray
+fsspec
+numpy
+torch # Or specify torch version for CUDA if applicable (e.g., torch==2.0.1+cu118)
+google-cloud-bigquery
+pandas
+python-dotenv # ONLY include if you are using it for local .env file loading
 gunicorn
