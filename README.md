@@ -69,7 +69,7 @@ Frontend runs on http://localhost:8501
 6. Explore interactive maps with colored prediction points
 
 ## Web UI preview
-[![Preview](https://github.com/AbhishekSai1551/Aurora-Wave-Prediction//main/assets/thumbnail1.jpg)](https://github.com/AbhishekSai1551/Aurora-Wave-Prediction/main/assets/preview1.mp4)
+[![Preview](https://raw.githubusercontent.com/AbhishekSai1551/Aurora-Wave-Prediction/main/assets/thumbnail1.jpg)](https://raw.githubusercontent.com/AbhishekSai1551/Aurora-Wave-Prediction/main/assets/preview1.mp4)
 (https://github.com/AbhishekSai1551/Aurora-Wave-Prediction//main/assets/thumbnail1.jpg)](https://github.com/AbhishekSai1551/Aurora-Wave-Prediction/main/assets/preview2.mp4)
 (https://github.com/AbhishekSai1551/Aurora-Wave-Prediction//main/assets/thumbnail2.jpg)](https://github.com/AbhishekSai1551/Aurora-Wave-Prediction/main/assets/preview3.mp4)
 (https://github.com/AbhishekSai1551/Aurora-Wave-Prediction//main/assets/thumbnail3.jpg)](https://github.com/AbhishekSai1551/Aurora-Wave-Prediction/main/assets/preview4.mp4)
