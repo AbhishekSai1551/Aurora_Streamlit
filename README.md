@@ -68,6 +68,9 @@ Frontend runs on http://localhost:8501
 5. Click "Run Prediction" to generate wave forecasts
 6. Explore interactive maps with colored prediction points
 
+## Web UI preview
+
+
 ## Project Structure
 
 ```
