@@ -21,7 +21,7 @@ A streamlined web application for oceanic wave predictions using Microsoft's Aur
 
 1. **Clone the repository**
 ```bash
-git clone https://github.com/yourusername/Aurora_Streamlit.git
+git clone https://github.com/AbhishekSai1551/Aurora-Wave-Prediction.git
 cd Aurora_Streamlit
 ```
 
