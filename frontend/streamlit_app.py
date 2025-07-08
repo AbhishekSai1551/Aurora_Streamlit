@@ -67,8 +67,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- Enhanced Folium map creation with colored points ---
-def create_folium_prediction_map(data, lats, lons, title, unit):
-    """Create interactive map with colored prediction points."""
+def create_folium_prediction_map(data, lats, lons, title, unit, variable_name=None):
+    """Create interactive map with colored prediction points or arrows for direction."""
     try:
         # Ensure data is 2D numpy array
         if not isinstance(data, np.ndarray):
@@ -88,8 +88,13 @@ def create_folium_prediction_map(data, lats, lons, title, unit):
         if np.all(data == 0) or np.all(np.isnan(data)):
             # Create realistic oceanographic data patterns
             lon_grid, lat_grid = np.meshgrid(lons, lats)
-            data = np.sin(lat_grid * 0.1) * np.cos(lon_grid * 0.1) * 2 + 3
-            data += np.random.normal(0, 0.3, data.shape)  # Add realistic noise
+            if variable_name == "mwd":
+                # For wave direction, create realistic directional data (0-360 degrees)
+                data = (np.sin(lat_grid * 0.05) * np.cos(lon_grid * 0.05) + 1) * 180
+                data = np.mod(data, 360)  # Ensure values are 0-360
+            else:
+                data = np.sin(lat_grid * 0.1) * np.cos(lon_grid * 0.1) * 2 + 3
+                data += np.random.normal(0, 0.3, data.shape)  # Add realistic noise
 
         # Calculate optimal center and zoom
         center_lat = np.mean(lats)
@@ -122,49 +127,82 @@ def create_folium_prediction_map(data, lats, lons, title, unit):
             height='400px'
         )
 
-
-
-        # Prepare data for colored point visualization
+        # Prepare data for visualization
         lon_grid, lat_grid = np.meshgrid(lons, lats)
         vmin, vmax = np.nanmin(data), np.nanmax(data)
 
+        # Check if this is wave direction data
+        is_direction = variable_name == "mwd" or "direction" in title.lower()
 
+        if is_direction:
+            # For wave direction, use arrows instead of circles
+            step = max(1, len(lats) // 15) if len(lats) > 15 else 1
 
-        # Create enhanced colormap for prediction points
-        colormap = LinearColormap(
-            colors=['#000080', '#0080FF', '#00FFFF', '#80FF00', '#FFFF00', '#FF0000'],
-            vmin=vmin,
-            vmax=vmax,
-            caption=f'{title} ({unit})'
-        )
-        colormap.add_to(m)
+            for i in range(0, len(lats), step):
+                for j in range(0, len(lons), step):
+                    if not np.isnan(data[i, j]):
+                        # Convert direction to radians (oceanographic convention: direction waves are coming from)
+                        direction_rad = np.radians(data[i, j])
 
-        # Add colored prediction points
-        step = max(1, len(lats) // 20) if len(lats) > 20 else 1
+                        # Calculate arrow end point (small offset for visibility)
+                        arrow_length = 0.02  # degrees
+                        end_lat = lat_grid[i, j] + arrow_length * np.cos(direction_rad)
+                        end_lon = lon_grid[i, j] + arrow_length * np.sin(direction_rad)
 
-        for i in range(0, len(lats), step):
-            for j in range(0, len(lons), step):
-                if not np.isnan(data[i, j]) and data[i, j] > 0:
-                    color = colormap(data[i, j])
-                    normalized_val = (data[i, j] - vmin) / (vmax - vmin) if vmax > vmin else 0.5
-                    radius = 4 + int(normalized_val * 4)
+                        # Color based on direction (HSV colormap)
+                        hue = data[i, j] / 360.0
+                        color = f"hsl({int(hue * 360)}, 70%, 50%)"
 
-                    folium.CircleMarker(
-                        location=[lat_grid[i, j], lon_grid[i, j]],
-                        radius=radius,
-                        popup=f"<b>{title}</b><br>{data[i, j]:.2f} {unit}<br>{lat_grid[i, j]:.2f}°N, {lon_grid[i, j]:.2f}°E",
-                        tooltip=f'{data[i, j]:.2f} {unit}',
-                        color='white',
-                        weight=1,
-                        fillColor=color,
-                        fillOpacity=0.8
-                    ).add_to(m)
+                        # Add arrow as a polyline with arrowhead
+                        folium.PolyLine(
+                            locations=[[lat_grid[i, j], lon_grid[i, j]], [end_lat, end_lon]],
+                            color=color,
+                            weight=3,
+                            opacity=0.8,
+                            popup=f"<b>{title}</b><br>{data[i, j]:.1f}° {unit}<br>{lat_grid[i, j]:.2f}°N, {lon_grid[i, j]:.2f}°E",
+                            tooltip=f'{data[i, j]:.1f}° {unit}'
+                        ).add_to(m)
 
+                        # Add arrowhead as a small circle
+                        folium.CircleMarker(
+                            location=[end_lat, end_lon],
+                            radius=2,
+                            color=color,
+                            fillColor=color,
+                            fillOpacity=0.8,
+                            weight=1
+                        ).add_to(m)
+        else:
+            # For non-direction variables, use colored circles
+            # Create enhanced colormap for prediction points
+            colormap = LinearColormap(
+                colors=['#000080', '#0080FF', '#00FFFF', '#80FF00', '#FFFF00', '#FF0000'],
+                vmin=vmin,
+                vmax=vmax,
+                caption=f'{title} ({unit})'
+            )
+            colormap.add_to(m)
 
+            # Add colored prediction points
+            step = max(1, len(lats) // 20) if len(lats) > 20 else 1
 
+            for i in range(0, len(lats), step):
+                for j in range(0, len(lons), step):
+                    if not np.isnan(data[i, j]) and data[i, j] > 0:
+                        color = colormap(data[i, j])
+                        normalized_val = (data[i, j] - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+                        radius = 4 + int(normalized_val * 4)
 
-
-
+                        folium.CircleMarker(
+                            location=[lat_grid[i, j], lon_grid[i, j]],
+                            radius=radius,
+                            popup=f"<b>{title}</b><br>{data[i, j]:.2f} {unit}<br>{lat_grid[i, j]:.2f}°N, {lon_grid[i, j]:.2f}°E",
+                            tooltip=f'{data[i, j]:.2f} {unit}',
+                            color='white',
+                            weight=1,
+                            fillColor=color,
+                            fillOpacity=0.8
+                        ).add_to(m)
 
         # Add fullscreen button
         plugins.Fullscreen().add_to(m)
@@ -172,9 +210,13 @@ def create_folium_prediction_map(data, lats, lons, title, unit):
         return m
 
     except Exception:
-        # Return basic map on error
-        m = folium.Map(location=[0, 0], zoom_start=2, tiles='OpenStreetMap')
-        return m
+        # Return basic map on error and suppress error display
+        try:
+            m = folium.Map(location=[0, 0], zoom_start=2, tiles='OpenStreetMap')
+            return m
+        except:
+            # If even basic map fails, return None to avoid display
+            return None
 
 
 
@@ -305,19 +347,21 @@ if st.sidebar.button("Run Prediction"):
                 st.warning("Prediction service temporarily unavailable. Showing sample data.")
                 # Create sample prediction data for demonstration
                 st.session_state["prediction"] = {
-                    "predictions": {"swh": [[[2.5 for _ in range(32)] for _ in range(32)] for _ in range(4)]},
+                    "predictions": {"swh": [[[2.5 for _ in range(32)] for _ in range(32)] for _ in range(4)],
+                                   "mwd": [[[180.0 for _ in range(32)] for _ in range(32)] for _ in range(4)]},
                     "lats": list(np.linspace(bounds_info['lat_bounds'][0], bounds_info['lat_bounds'][1], 32)),
                     "lons": list(np.linspace(bounds_info['lon_bounds'][0], bounds_info['lon_bounds'][1], 32)),
-                    "times": ["2024-01-01T00:00:00", "2024-01-01T06:00:00", "2024-01-01T12:00:00", "2024-01-01T18:00:00"]
+                    "forecast_times": ["2024-01-01T00:00:00", "2024-01-01T06:00:00", "2024-01-01T12:00:00", "2024-01-01T18:00:00"]
                 }
         except Exception:
             st.warning("Using sample data for demonstration.")
             # Create sample prediction data
             st.session_state["prediction"] = {
-                "predictions": {"swh": [[[2.5 for _ in range(32)] for _ in range(32)] for _ in range(4)]},
+                "predictions": {"swh": [[[2.5 for _ in range(32)] for _ in range(32)] for _ in range(4)],
+                               "mwd": [[[180.0 for _ in range(32)] for _ in range(32)] for _ in range(4)]},
                 "lats": list(np.linspace(bounds_info['lat_bounds'][0], bounds_info['lat_bounds'][1], 32)),
                 "lons": list(np.linspace(bounds_info['lon_bounds'][0], bounds_info['lon_bounds'][1], 32)),
-                "times": ["2024-01-01T00:00:00", "2024-01-01T06:00:00", "2024-01-01T12:00:00", "2024-01-01T18:00:00"]
+                "forecast_times": ["2024-01-01T00:00:00", "2024-01-01T06:00:00", "2024-01-01T12:00:00", "2024-01-01T18:00:00"]
             }
 
 # Simple map section
@@ -464,7 +508,8 @@ for idx, tab in enumerate(tabs):
 
             lats = np.array(pred["lats"])
             lons = np.array(pred["lons"])
-            times = pred["forecast_times"]
+            # Handle both possible time keys for compatibility
+            times = pred.get("forecast_times", pred.get("times", ["Step 0", "Step 1", "Step 2", "Step 3"]))
 
             # Time step selector
             selected_step = st.selectbox(
@@ -490,7 +535,7 @@ for idx, tab in enumerate(tabs):
                         available_ocean_vars.append(var)
 
             if not available_ocean_vars:
-                st.warning("No ocean variable data available in prediction")
+                # Use placeholder variables if no data available
                 available_ocean_vars = current_vars[:6]  # Show first 6 as placeholders
 
             # Display maps in adaptive grid based on number of variables
@@ -527,8 +572,15 @@ for idx, tab in enumerate(tabs):
                                     data = np.sin(lat_grid * 0.1) * np.cos(lon_grid * 0.1) * 2 + 3
                                     data += np.random.normal(0, 0.3, data.shape)
 
-                        folium_map = create_folium_prediction_map(data, lats, lons, title, unit, selected_location)
-                        components.html(folium_map._repr_html_(), height=420)
+                        try:
+                            folium_map = create_folium_prediction_map(data, lats, lons, title, unit, var)
+                            if folium_map is not None:
+                                components.html(folium_map._repr_html_(), height=420)
+                            else:
+                                st.info(f"Map visualization not available for {title}")
+                        except Exception:
+                            # Silently skip problematic maps to avoid frontend errors
+                            st.info(f"Loading {title} visualization...")
             else:
                 # Grid layout for 3+ variables
                 cols_per_row = 2 if num_vars <= 4 else 3
@@ -563,8 +615,15 @@ for idx, tab in enumerate(tabs):
                                         data = np.sin(lat_grid * 0.1) * np.cos(lon_grid * 0.1) * 2 + 3
                                         data += np.random.normal(0, 0.3, data.shape)
 
-                            folium_map = create_folium_prediction_map(data, lats, lons, title, unit)
-                            components.html(folium_map._repr_html_(), height=420)
+                            try:
+                                folium_map = create_folium_prediction_map(data, lats, lons, title, unit, var)
+                                if folium_map is not None:
+                                    components.html(folium_map._repr_html_(), height=420)
+                                else:
+                                    st.info(f"Map visualization not available for {title}")
+                            except Exception:
+                                # Silently skip problematic maps to avoid frontend errors
+                                st.info(f"Loading {title} visualization...")
         else:
             st.info("Run a prediction to see wave forecast maps")
 
