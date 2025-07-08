@@ -36,20 +36,41 @@ ECMWF_CONFIG = {
     "dataset": "ifs-hres",
     "atmospheric_variables": [
         "temperature",
-        "u_component_of_wind", 
+        "u_component_of_wind",
         "v_component_of_wind",
         "specific_humidity",
         "geopotential"
     ],
     "surface_variables": [
         "10m_u_component_of_wind",
-        "10m_v_component_of_wind", 
+        "10m_v_component_of_wind",
         "2m_temperature",
         "mean_sea_level_pressure"
     ],
     "pressure_levels": [1000, 925, 850, 700, 500, 300, 250, 200, 150, 100, 70, 50, 30],
     "time_range_days": 30,
     "resolution": "0.25"
+}
+
+# --- ECMWF Wave Data Configuration ---
+ECMWF_WAVE_CONFIG = {
+    "stream": "wave",
+    "wave_variables": [
+        "swh",    # Significant height of combined wind waves and swell
+        "mwd",    # Mean wave direction
+        "mwp",    # Mean wave period
+        "pp1d",   # Peak wave period
+        "mp2",    # Mean zero-crossing wave period
+    ],
+    "aurora_variable_mapping": {
+        "swh": "swh",     # Direct mapping
+        "mwd": "mwd",     # Direct mapping
+        "mwp": "mwp",     # Direct mapping
+        "pp1d": "pp1d",   # Direct mapping
+        "mp2": "mp2",     # Additional period variable
+    },
+    "resolution": "0.25",
+    "time_range_days": 30
 }
 
 # --- NOAA Weather Watch Configuration ---

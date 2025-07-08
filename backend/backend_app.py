@@ -6,7 +6,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 from config import DOWNLOAD_PATH, API_CONFIG, DEFAULT_BOUNDS
-from aurora_data_sources import HuggingFaceDataSource, ECMWFDataSource, NOAADataSource
+from aurora_data_sources import HuggingFaceDataSource, ECMWFDataSource, ECMWFWaveDataSource
 from aurora_interface import AuroraModelInterface
 
 app = Flask(__name__)
@@ -15,8 +15,45 @@ CORS(app)
 # Initialize data sources and model
 hf_source = HuggingFaceDataSource(DOWNLOAD_PATH)
 ecmwf_source = ECMWFDataSource(DOWNLOAD_PATH)
-noaa_source = NOAADataSource(DOWNLOAD_PATH)
+ecmwf_wave_source = ECMWFWaveDataSource(DOWNLOAD_PATH)  # Replace NOAA with ECMWF wave data
 aurora_model = AuroraModelInterface(model_type="wave")
+
+def _get_or_download_wave_data(wave_source, date_range, lat_bounds, lon_bounds):
+    """Get existing wave data file or download if not available.
+
+    This prevents duplicate downloads when prediction endpoint is called
+    after the download-data endpoint.
+    """
+    from pathlib import Path
+    import os
+    from datetime import datetime, timedelta
+
+    # Generate the expected cache filename
+    cache_filename = wave_source.get_cache_filename(
+        date_range, lat_bounds, lon_bounds, "wave.grib2"
+    )
+    cache_file = wave_source.download_path / cache_filename
+
+    # Check for both .grib2 and .nc versions
+    grib_file = cache_file
+    nc_file = cache_file.with_suffix('.nc')
+
+    # Check if files exist and are recent (within last 6 hours)
+    current_time = datetime.now()
+    max_age = timedelta(hours=6)
+
+    for file_path in [grib_file, nc_file]:
+        if file_path.exists():
+            file_age = current_time - datetime.fromtimestamp(file_path.stat().st_mtime)
+            if file_age < max_age:
+                print(f"Using existing wave data file: {file_path}")
+                return str(file_path)
+            else:
+                print(f"Wave data file exists but is too old ({file_age}), re-downloading...")
+
+    # No suitable existing file found, download new data
+    print("No recent wave data found, downloading...")
+    return wave_source.download_data(date_range, lat_bounds, lon_bounds)
 
 # Load static variables
 try:
@@ -53,10 +90,10 @@ def download_data():
             results["ecmwf"] = {"status": "error", "error": str(e)}
 
         try:
-            ocean_file = noaa_source.download_monthly_data(end_date, lat_bounds, lon_bounds)
-            results["noaa"] = {"ocean_file": ocean_file, "status": "success"}
+            ocean_file = ecmwf_wave_source.download_monthly_data(end_date, lat_bounds, lon_bounds)
+            results["ecmwf_wave"] = {"ocean_file": ocean_file, "status": "success"}
         except Exception as e:
-            results["noaa"] = {"status": "error", "error": str(e)}
+            results["ecmwf_wave"] = {"status": "error", "error": str(e)}
 
         results["huggingface"] = {"static_variables": len(static_variables), "status": "success" if static_variables else "error"}
 
@@ -82,14 +119,16 @@ def predict():
         # Convert longitude bounds for Aurora compatibility
         aurora_lon_bounds = [(lon + 360) % 360 for lon in lon_bounds]
 
-        # Load data
+        # Load data (check for existing files first to avoid duplicate downloads)
         surface_file = ecmwf_source.download_data(date_range, lat_bounds, aurora_lon_bounds, "surface")
         atmospheric_file = ecmwf_source.download_data(date_range, lat_bounds, aurora_lon_bounds, "atmospheric")
-        ocean_file = noaa_source.download_data(date_range, lat_bounds, aurora_lon_bounds)
+
+        # Check if wave data was already downloaded by the download-data endpoint
+        ocean_file = _get_or_download_wave_data(ecmwf_wave_source, date_range, lat_bounds, aurora_lon_bounds)
 
         surface_ds = ecmwf_source.load_data(surface_file)
         atmospheric_ds = ecmwf_source.load_data(atmospheric_file)
-        ocean_ds = noaa_source.load_data(ocean_file)
+        ocean_ds = ecmwf_wave_source.load_data(ocean_file)
 
         # Prepare variables and run prediction
         surf_vars = aurora_model.prepare_surface_variables(surface_ds, ocean_ds)
@@ -104,7 +143,7 @@ def predict():
 
         batch = aurora_model.create_batch(surf_vars, atmos_vars, static_variables, metadata_info)
         predictions = aurora_model.predict(batch, steps)
-        extracted_predictions = aurora_model.extract_predictions(predictions, noaa_source.get_available_variables(), enhance_resolution=True)
+        extracted_predictions = aurora_model.extract_predictions(predictions, ecmwf_wave_source.get_available_variables(), enhance_resolution=True)
 
         # Generate response coordinates
         base_time = datetime.datetime.strptime(target_date, "%Y-%m-%d")

@@ -1,7 +1,7 @@
 """Aurora model interface"""
 
 import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 import torch
 import numpy as np
 import xarray as xr
@@ -29,18 +29,9 @@ class AuroraModelInterface:
         except Exception as e:
             raise
     
-    def prepare_surface_variables(self, 
+    def prepare_surface_variables(self,
                                 surface_ds: xr.Dataset,
                                 ocean_ds: xr.Dataset = None) -> Dict[str, torch.Tensor]:
-        """Prepare surface variables for Aurora model.
-        
-        Args:
-            surface_ds: Surface variables dataset
-            ocean_ds: Ocean variables dataset (optional)
-            
-        Returns:
-            Dictionary of prepared surface variables
-        """
         surf_vars = {}
         
         # Standard surface variables mapping
@@ -55,15 +46,29 @@ class AuroraModelInterface:
         for aurora_var, ecmwf_var in surface_mapping.items():
             if ecmwf_var in surface_ds:
                 data = surface_ds[ecmwf_var].values
-                surf_vars[aurora_var] = self._prepare_tensor(data)
+                surf_vars[aurora_var] = self._prepare_tensor(data, data_type="surface")
 
         # Add ocean variables if available
         if ocean_ds is not None:
+            # Get target spatial shape from surface data
+            target_shape = None
+            for var_name, var_tensor in surf_vars.items():
+                if var_tensor.ndim >= 2:
+                    target_shape = var_tensor.shape[-2:]  # (lat, lon)
+                    break
+
             ocean_vars = ["swh", "mwd", "mwp", "pp1d"]
             for var in ocean_vars:
                 if var in ocean_ds:
                     data = ocean_ds[var].values
-                    surf_vars[var] = self._prepare_tensor(data)
+
+                    # Resize ocean data to match surface data spatial resolution if needed
+                    if target_shape is not None and data.ndim >= 2:
+                        current_shape = data.shape[-2:]
+                        if current_shape != target_shape:
+                            data = self._resize_data(data, target_shape)
+
+                    surf_vars[var] = self._prepare_tensor(data, data_type="wave")
         
         # Add required wave-specific variables for AuroraWave
         if self.model_type == "wave":
@@ -71,16 +76,8 @@ class AuroraModelInterface:
         
         return surf_vars
     
-    def prepare_atmospheric_variables(self, 
+    def prepare_atmospheric_variables(self,
                                     atmospheric_ds: xr.Dataset) -> Dict[str, torch.Tensor]:
-        """Prepare atmospheric variables for Aurora model.
-        
-        Args:
-            atmospheric_ds: Atmospheric variables dataset
-            
-        Returns:
-            Dictionary of prepared atmospheric variables
-        """
         atmos_vars = {}
         
         # Atmospheric variables mapping
@@ -93,36 +90,106 @@ class AuroraModelInterface:
         for aurora_var, ecmwf_var in atmospheric_mapping.items():
             if ecmwf_var in atmospheric_ds:
                 data = atmospheric_ds[ecmwf_var].values
-                atmos_vars[aurora_var] = self._prepare_tensor(data)
-                print(f"Prepared atmospheric variable {aurora_var}: {atmos_vars[aurora_var].shape}")
+                atmos_vars[aurora_var] = self._prepare_tensor(data, data_type="atmospheric")
         
         return atmos_vars
     
-    def _prepare_tensor(self, data: np.ndarray) -> torch.Tensor:
-        """Prepare numpy array as PyTorch tensor for Aurora.
-        
-        Args:
-            data: Input numpy array
-            
-        Returns:
-            Prepared PyTorch tensor
-        """
-        # Ensure we have the right number of dimensions
+    def _prepare_tensor(self, data: np.ndarray, data_type: str = "auto") -> torch.Tensor:
+
         if data.ndim == 3:  # (time, lat, lon)
             # Take first 2 time steps and add batch dimension
-            tensor = torch.from_numpy(data[:2][None][..., ::-1, :].copy())
-        elif data.ndim == 4:  # (time, level, lat, lon)
-            # Take first 2 time steps and add batch dimension
-            tensor = torch.from_numpy(data[:2][None][..., ::-1, :].copy())
+            tensor = torch.from_numpy(data[:2][None, :, ::-1, :].copy())
+        elif data.ndim == 4:
+            # Distinguish between wave data and atmospheric data
+            if data_type == "atmospheric" or (data_type == "auto" and data.shape[1] == 5):
+                # Atmospheric data: (time, level, lat, lon) - preserve levels
+                # Take first 2 time steps and add batch dimension
+                tensor = torch.from_numpy(data[:2][None, :, ::-1, :].copy())
+
+            elif data_type == "wave" or (data_type == "auto" and data.shape[1] <= 3):
+                # Wave data with forecast steps: (time, step, lat, lon)
+                # Average over forecast steps to get (time, lat, lon)
+                data_avg = np.mean(data, axis=1)  # Average over step dimension
+                # Take first 2 time steps and add batch dimension
+                tensor = torch.from_numpy(data_avg[:2][None, :, ::-1, :].copy())
+
+            else:
+                # Auto-detect based on shape
+                if data.shape[1] <= 3:
+                    # Likely wave data with forecast steps
+                    data_avg = np.mean(data, axis=1)
+                    tensor = torch.from_numpy(data_avg[:2][None, :, ::-1, :].copy())
+
+                else:
+                    # Likely atmospheric data with pressure levels
+                    tensor = torch.from_numpy(data[:2][None, :, ::-1, :].copy())
+
         elif data.ndim == 2:  # (lat, lon) - single time step
             # Add time and batch dimensions
             tensor = torch.from_numpy(data[None, None, ::-1, :].copy())
         else:
-            print(f"Warning: Unexpected data shape: {data.shape}")
+
             tensor = torch.from_numpy(data[None].copy())
-        
+
         return tensor.float()
-    
+
+    def _resize_data(self, data: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+        """Resize data to target spatial shape using interpolation.
+
+        Args:
+            data: Input data array
+            target_shape: Target (height, width) shape
+
+        Returns:
+            Resized data array
+        """
+        from scipy.interpolate import RegularGridInterpolator
+
+        # Handle different data dimensions
+        if data.ndim == 2:  # (lat, lon)
+            return self._resize_2d(data, target_shape)
+        elif data.ndim == 3:  # (time, lat, lon)
+            resized = np.zeros((data.shape[0], target_shape[0], target_shape[1]))
+            for t in range(data.shape[0]):
+                resized[t] = self._resize_2d(data[t], target_shape)
+            return resized
+        elif data.ndim == 4:  # (time, level, lat, lon)
+            resized = np.zeros((data.shape[0], data.shape[1], target_shape[0], target_shape[1]))
+            for t in range(data.shape[0]):
+                for l in range(data.shape[1]):
+                    resized[t, l] = self._resize_2d(data[t, l], target_shape)
+            return resized
+        else:
+            print(f"Warning: Cannot resize data with shape {data.shape}")
+            return data
+
+    def _resize_2d(self, data: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
+        """Resize 2D data using bilinear interpolation."""
+        from scipy.interpolate import RegularGridInterpolator
+
+        current_height, current_width = data.shape
+        target_height, target_width = target_shape
+
+        # Create coordinate grids
+        y_old = np.linspace(0, 1, current_height)
+        x_old = np.linspace(0, 1, current_width)
+
+        y_new = np.linspace(0, 1, target_height)
+        x_new = np.linspace(0, 1, target_width)
+
+        # Create interpolator
+        interpolator = RegularGridInterpolator((y_old, x_old), data,
+                                             method='linear', bounds_error=False, fill_value=0)
+
+        # Create new coordinate mesh
+        Y_new, X_new = np.meshgrid(y_new, x_new, indexing='ij')
+        points = np.column_stack([Y_new.ravel(), X_new.ravel()])
+
+        # Interpolate
+        resized_data = interpolator(points).reshape(target_height, target_width)
+
+        return resized_data
+
     def _add_wave_specific_variables(self, surf_vars: Dict[str, torch.Tensor]):
         """Add wave-specific variables required by AuroraWave model."""
         if "swh" in surf_vars:
