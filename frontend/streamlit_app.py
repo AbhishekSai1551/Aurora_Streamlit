@@ -289,7 +289,7 @@ if selected_location in location_coords:
 # Add data source information
 with st.sidebar.expander("Data Sources"):
     try:
-        sources_res = requests.get("http://localhost:5000/api/data-sources", timeout=2)
+        sources_res = requests.get("http://localhost:5001/api/data-sources", timeout=2)
         if sources_res.status_code == 200:
             sources_data = sources_res.json()
             for source_name, source_info in sources_data.items():
@@ -314,7 +314,7 @@ if st.sidebar.button("Download Data"):
     st.sidebar.info(f"Downloading data for {selected_location}")
     with st.spinner(f"Downloading data for {bounds_info['description']}..."):
         try:
-            download_res = requests.post("http://localhost:5000/api/download-data", json=download_payload)
+            download_res = requests.post("http://localhost:5001/api/download-data", json=download_payload)
             if download_res.status_code == 200:
                 download_data = download_res.json()
                 st.success(f"Data downloaded for {selected_location}")
@@ -338,7 +338,7 @@ if st.sidebar.button("Run Prediction"):
     st.sidebar.info(f"Running prediction for {selected_location}")
     with st.spinner(f"Running Aurora model for {bounds_info['description']}..."):
         try:
-            res = requests.post("http://localhost:5000/api/predict_oceanic", json=payload)
+            res = requests.post("http://localhost:5001/api/predict_oceanic", json=payload)
             if res.status_code == 200:
                 st.session_state["prediction"] = res.json()
                 st.success(f"Wave prediction completed for {selected_location}")
@@ -417,7 +417,7 @@ with col2:
 
     # Add backend status check
     try:
-        health_res = requests.get("http://localhost:5000/api/health", timeout=2)
+        health_res = requests.get("http://localhost:5001/api/health", timeout=2)
         if health_res.status_code == 200:
             st.success("Backend Online")
             health_data = health_res.json()
