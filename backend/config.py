@@ -128,7 +128,7 @@ PROCESSING_CONFIG = {
 # --- API Configuration ---
 API_CONFIG = {
     "host": "0.0.0.0",
-    "port": 5000,
+    "port": 5001,
     "debug": True,
     "cors_enabled": True
 }

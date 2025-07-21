@@ -95,42 +95,40 @@ class AuroraModelInterface:
         return atmos_vars
     
     def _prepare_tensor(self, data: np.ndarray, data_type: str = "auto") -> torch.Tensor:
-
         if data.ndim == 3:  # (time, lat, lon)
-            # Take first 2 time steps and add batch dimension
-            tensor = torch.from_numpy(data[:2][None, :, ::-1, :].copy())
+            # Take last 2 time steps and add batch dimension
+            tensor = torch.from_numpy(data[-2:][None, :, ::-1, :].copy())
         elif data.ndim == 4:
             # Distinguish between wave data and atmospheric data
             if data_type == "atmospheric" or (data_type == "auto" and data.shape[1] == 5):
                 # Atmospheric data: (time, level, lat, lon) - preserve levels
-                # Take first 2 time steps and add batch dimension
-                tensor = torch.from_numpy(data[:2][None, :, ::-1, :].copy())
+                # Take last 2 time steps and add batch dimension
+                tensor = torch.from_numpy(data[-2:][None, :, ::-1, :].copy())
 
             elif data_type == "wave" or (data_type == "auto" and data.shape[1] <= 3):
                 # Wave data with forecast steps: (time, step, lat, lon)
                 # Average over forecast steps to get (time, lat, lon)
                 data_avg = np.mean(data, axis=1)  # Average over step dimension
-                # Take first 2 time steps and add batch dimension
-                tensor = torch.from_numpy(data_avg[:2][None, :, ::-1, :].copy())
+                # Take last 2 time steps and add batch dimension
+                tensor = torch.from_numpy(data_avg[-2:][None, :, ::-1, :].copy())
 
             else:
                 # Auto-detect based on shape
                 if data.shape[1] <= 3:
                     # Likely wave data with forecast steps
                     data_avg = np.mean(data, axis=1)
-                    tensor = torch.from_numpy(data_avg[:2][None, :, ::-1, :].copy())
+                    tensor = torch.from_numpy(data_avg[-2:][None, :, ::-1, :].copy())
 
                 else:
                     # Likely atmospheric data with pressure levels
-                    tensor = torch.from_numpy(data[:2][None, :, ::-1, :].copy())
+                    tensor = torch.from_numpy(data[-2:][None, :, ::-1, :].copy())
 
         elif data.ndim == 2:  # (lat, lon) - single time step
             # Add time and batch dimensions
             tensor = torch.from_numpy(data[None, None, ::-1, :].copy())
         else:
-
             tensor = torch.from_numpy(data[None].copy())
-
+        
         return tensor.float()
 
     def _resize_data(self, data: np.ndarray, target_shape: Tuple[int, int]) -> np.ndarray:
